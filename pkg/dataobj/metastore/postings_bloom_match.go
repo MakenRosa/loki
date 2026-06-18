@@ -1,4 +1,4 @@
-package postings
+package metastore
 
 import (
 	"bytes"
@@ -13,14 +13,14 @@ import (
 	"github.com/grafana/loki/v3/pkg/xcap"
 )
 
-// Key identifies a bloom-match result by its (object path, section index) tuple. Defined locally
-// to avoid an import cycle with metastore, which converts it to metastore.SectionKey.
-type Key struct {
-	ObjectPath   string
-	SectionIndex int64
-}
-
-func MatchSections(ctx context.Context, batches []arrow.RecordBatch, matchers []*labels.Matcher) (map[Key]struct{}, error) {
+// matchSections returns the (object, section) keys whose bloom rows match every
+// Equal matcher. Each bloom row is self-contained, so matching the bloom rows
+// from every postings section together is equivalent to matching a single
+// section.
+//
+// The input batches carry the columns [object_path, section_index, column_name,
+// bloom_filter] in that order (kind, if projected, is ignored).
+func matchSections(ctx context.Context, batches []arrow.RecordBatch, matchers []*labels.Matcher) (map[SectionKey]struct{}, error) {
 	// Filter to MatchEqual matchers only; other types are handled on separate caller paths.
 	equalMatchers := make([]*labels.Matcher, 0, len(matchers))
 	for _, m := range matchers {
@@ -29,10 +29,10 @@ func MatchSections(ctx context.Context, batches []arrow.RecordBatch, matchers []
 		}
 	}
 	if len(equalMatchers) == 0 {
-		return map[Key]struct{}{}, nil
+		return map[SectionKey]struct{}{}, nil
 	}
 
-	ctx, span := xcap.StartSpan(ctx, tracer, "postings.MatchSections")
+	ctx, span := xcap.StartSpan(ctx, tracer, "metastore.matchSections")
 	defer span.End()
 	// Accumulate bloom-deserialize failures locally and record once at the
 	// end — keeps the inner per-row loop free of region lookups while still
@@ -51,32 +51,29 @@ func MatchSections(ctx context.Context, batches []arrow.RecordBatch, matchers []
 		predicateIndexesByName[m.Name] = append(predicateIndexesByName[m.Name], i)
 	}
 
-	sectionMatches := make(map[Key]map[int]struct{})
+	sectionMatches := make(map[SectionKey]map[int]struct{})
 
 	for _, rec := range batches {
 		if rec == nil || rec.NumRows() == 0 {
 			continue
 		}
 
-		// Column-position contract: ReadBloomRows projects exactly
-		// [object_path, section_index, column_name, bloom_filter] in that
-		// order. Type-assertions are guarded so a projection drift surfaces
-		// as a typed error rather than a panic.
+		// Guarded so a projection drift surfaces as a typed error, not a panic.
 		pathCol, ok := rec.Column(0).(*array.String)
 		if !ok {
-			return nil, fmt.Errorf("ReadBloomRows projection violated: column 0 wrong type %T", rec.Column(0))
+			return nil, fmt.Errorf("bloom projection violated: column 0 wrong type %T", rec.Column(0))
 		}
 		sectionCol, ok := rec.Column(1).(*array.Int64)
 		if !ok {
-			return nil, fmt.Errorf("ReadBloomRows projection violated: column 1 wrong type %T", rec.Column(1))
+			return nil, fmt.Errorf("bloom projection violated: column 1 wrong type %T", rec.Column(1))
 		}
 		columnNameCol, ok := rec.Column(2).(*array.String)
 		if !ok {
-			return nil, fmt.Errorf("ReadBloomRows projection violated: column 2 wrong type %T", rec.Column(2))
+			return nil, fmt.Errorf("bloom projection violated: column 2 wrong type %T", rec.Column(2))
 		}
 		bloomCol, ok := rec.Column(3).(*array.Binary)
 		if !ok {
-			return nil, fmt.Errorf("ReadBloomRows projection violated: column 3 wrong type %T", rec.Column(3))
+			return nil, fmt.Errorf("bloom projection violated: column 3 wrong type %T", rec.Column(3))
 		}
 
 		for i := 0; i < int(rec.NumRows()); i++ {
@@ -89,13 +86,13 @@ func MatchSections(ctx context.Context, batches []arrow.RecordBatch, matchers []
 				continue
 			}
 
-			sectionKey := Key{
-				ObjectPath:   pathCol.Value(i),
-				SectionIndex: sectionCol.Value(i),
+			sectionKey := SectionKey{
+				ObjectPath: pathCol.Value(i),
+				SectionIdx: sectionCol.Value(i),
 			}
 
 			for _, predicateIndex := range predicateIndexes {
-				mayContain, deserializeFailed := bloomFilterMayContain(
+				mayContain, deserializeFailed := postingsBloomFilterMayContain(
 					bloomCol.Value(i),
 					equalMatchers[predicateIndex].Value,
 				)
@@ -115,9 +112,9 @@ func MatchSections(ctx context.Context, batches []arrow.RecordBatch, matchers []
 		}
 	}
 
-	// a Key is kept only if every Equal matcher matched at
-	// least one bloom row for that Key.
-	matchedSectionKeys := make(map[Key]struct{})
+	// A key is kept only if every Equal matcher matched at least one bloom row
+	// for that key.
+	matchedSectionKeys := make(map[SectionKey]struct{})
 	for sectionKey, matchedPredicates := range sectionMatches {
 		if len(matchedPredicates) == len(equalMatchers) {
 			matchedSectionKeys[sectionKey] = struct{}{}
@@ -126,8 +123,9 @@ func MatchSections(ctx context.Context, batches []arrow.RecordBatch, matchers []
 	return matchedSectionKeys, nil
 }
 
-// bloomFilterMayContain reports whether value may be present in the bloom filter
-func bloomFilterMayContain(bloomBytes []byte, value string) (mayContain, deserializeFailed bool) {
+// postingsBloomFilterMayContain reports whether value may be present in the
+// bloom filter, and whether deserialization failed (treated as "may contain").
+func postingsBloomFilterMayContain(bloomBytes []byte, value string) (mayContain, deserializeFailed bool) {
 	defer func() {
 		if r := recover(); r != nil {
 			// Corrupted payload that panics on ReadFrom must yield "may contain", not propagate.

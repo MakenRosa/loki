@@ -1,4 +1,4 @@
-package postings_test
+package metastore
 
 import (
 	"errors"
@@ -8,6 +8,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/arrow/scalar"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/stretchr/testify/require"
 
@@ -16,7 +17,7 @@ import (
 )
 
 func TestMatchSections_AND_Semantics(t *testing.T) {
-	fx := buildBloomFixture(t, []bloomFixtureEntry{
+	obj := buildBloomObject(t, []bloomFixtureEntry{
 		{objectPath: "/objA", sectionIndex: 0, columnName: "env", values: []string{"prod"}},
 		{objectPath: "/objA", sectionIndex: 0, columnName: "app", values: []string{"foo"}},
 		{objectPath: "/objB", sectionIndex: 0, columnName: "env", values: []string{"prod"}},
@@ -25,34 +26,30 @@ func TestMatchSections_AND_Semantics(t *testing.T) {
 		{objectPath: "/objC", sectionIndex: 0, columnName: "app", values: []string{"foo"}},
 	})
 
-	batches := readAllBloomBatches(t, fx.sec)
-
-	result, err := postings.MatchSections(t.Context(), batches, []*labels.Matcher{
+	result, err := matchSectionsFromObject(t, obj, []*labels.Matcher{
 		equalMatcher(t, "env", "prod"),
 		equalMatcher(t, "app", "foo"),
 	})
 	require.NoError(t, err)
 
 	require.Len(t, result, 1, "exactly one section should match both env=prod AND app=foo")
-	_, ok := result[postings.Key{ObjectPath: "/objA", SectionIndex: 0}]
+	_, ok := result[SectionKey{ObjectPath: "/objA", SectionIdx: 0}]
 	require.True(t, ok, "section A (/objA, 0) should be the sole match")
 }
 
 func TestMatchSections_EqualMatcherOnly_FilterApplied(t *testing.T) {
-	fx := buildBloomFixture(t, []bloomFixtureEntry{
+	obj := buildBloomObject(t, []bloomFixtureEntry{
 		{objectPath: "/obj", sectionIndex: 0, columnName: "env", values: []string{"prod"}},
 	})
 
-	batches := readAllBloomBatches(t, fx.sec)
-
-	result, err := postings.MatchSections(t.Context(), batches, []*labels.Matcher{
+	result, err := matchSectionsFromObject(t, obj, []*labels.Matcher{
 		equalMatcher(t, "env", "prod"),
 		regexMatcher(t, "app", ".*"),
 	})
 	require.NoError(t, err)
 
 	require.Len(t, result, 1, "Equal matcher alone should match the section; Regex matcher is filtered out")
-	_, ok := result[postings.Key{ObjectPath: "/obj", SectionIndex: 0}]
+	_, ok := result[SectionKey{ObjectPath: "/obj", SectionIdx: 0}]
 	require.True(t, ok)
 }
 
@@ -63,15 +60,10 @@ type bloomFixtureEntry struct {
 	values       []string
 }
 
-type bloomFixture struct {
-	sec *postings.Section
-}
-
-func buildBloomFixture(t *testing.T, entries []bloomFixtureEntry) bloomFixture {
+func buildBloomObject(t *testing.T, entries []bloomFixtureEntry) *dataobj.Object {
 	t.Helper()
 
 	pb := postings.NewBuilder(nil, 0, 0, 1<<20)
-
 	ts := time.Unix(0, 1000).UTC()
 	for _, e := range entries {
 		pb.PrepareBloomColumn(e.objectPath, e.sectionIndex, e.columnName, uint(len(e.values)))
@@ -93,46 +85,52 @@ func buildBloomFixture(t *testing.T, entries []bloomFixtureEntry) bloomFixture {
 	obj, closer, err := objBuilder.Flush()
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = closer.Close() })
-
-	var fx bloomFixture
-	for _, sec := range obj.Sections() {
-		if !postings.CheckSection(sec) {
-			continue
-		}
-		s, err := postings.Open(t.Context(), sec)
-		require.NoError(t, err)
-		fx.sec = s
-		break
-	}
-	require.NotNil(t, fx.sec, "postings section missing from fixture")
-	return fx
+	return obj
 }
 
-func readAllBloomBatches(t *testing.T, sec *postings.Section) []arrow.RecordBatch {
-	t.Helper()
+// matchSectionsFromObject runs the production bloom path over obj: a generic
+// postings.Reader (kind == KindBloom) feeding matchSections.
+func matchSectionsFromObject(tb testing.TB, obj *dataobj.Object, matchers []*labels.Matcher) (map[SectionKey]struct{}, error) {
+	tb.Helper()
 
-	r := postings.NewReader(postings.ReaderOptions{
-		Columns:   sec.Columns(),
-		Allocator: memory.DefaultAllocator,
-	})
-	require.NoError(t, r.Open(t.Context()))
-	t.Cleanup(func() { _ = r.Close() })
+	var recs []arrow.RecordBatch
+	for _, section := range obj.Sections() {
+		if !postings.CheckSection(section) {
+			continue
+		}
+		sec, err := postings.Open(tb.Context(), section)
+		require.NoError(tb, err)
 
-	var batches []arrow.RecordBatch
-	for {
-		rb, err := r.ReadBloomRows(t.Context())
-		if rb != nil && rb.NumRows() > 0 {
-			batches = append(batches, rb)
+		cols, err := findPostingsColumnsByTypes(sec.Columns(),
+			postings.ColumnTypeObjectPath,
+			postings.ColumnTypeSectionIndex,
+			postings.ColumnTypeColumnName,
+			postings.ColumnTypeBloomFilter,
+			postings.ColumnTypeKind,
+		)
+		require.NoError(tb, err)
+
+		reader := postings.NewReader(postings.ReaderOptions{
+			Columns: cols,
+			Predicates: []postings.Predicate{
+				postings.EqualPredicate{Column: cols[len(cols)-1], Value: scalar.NewInt64Scalar(int64(postings.KindBloom))},
+			},
+			Allocator: memory.DefaultAllocator,
+		})
+		require.NoError(tb, reader.Open(tb.Context()))
+		for {
+			rec, err := reader.Read(tb.Context(), 4096)
+			if rec != nil && rec.NumRows() > 0 {
+				recs = append(recs, rec)
+			}
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			require.NoError(tb, err)
 		}
-		if err == nil {
-			break
-		}
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		require.NoError(t, err)
+		_ = reader.Close()
 	}
-	return batches
+	return matchSections(tb.Context(), recs, matchers)
 }
 
 func equalMatcher(t *testing.T, name, value string) *labels.Matcher {

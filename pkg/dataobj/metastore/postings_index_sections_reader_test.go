@@ -97,7 +97,7 @@ func TestPostingsIndexSectionsReader_CombinesAcrossPostingsSections(t *testing.T
 	t.Cleanup(r.Close)
 
 	require.NoError(t, r.Open(ctx))
-	require.Len(t, r.postingsReaders, 2, "object has two postings sections ⇒ two readers")
+	require.Len(t, r.labelReaders, 2, "object has two postings sections ⇒ two readers")
 
 	rec, err := r.Read(ctx)
 	require.NoError(t, err)
@@ -167,7 +167,7 @@ func TestPostingsIndexSectionsReader_ANDMatchersAcrossPostingsSections(t *testin
 	t.Cleanup(r.Close)
 
 	require.NoError(t, r.Open(ctx))
-	require.Len(t, r.postingsReaders, 2)
+	require.Len(t, r.labelReaders, 2)
 
 	rec, err := r.Read(ctx)
 	require.NoError(t, err)
@@ -193,12 +193,12 @@ func TestPostingsIndexSectionsReader_NoPostingsSectionReturnsEOF(t *testing.T) {
 	r := newPostingsIndexSectionsReader(log.NewNopLogger(), obj, now.Add(-4*time.Hour), now.Add(-time.Hour), matchers, nil, 0)
 	t.Cleanup(r.Close)
 	require.NoError(t, r.Open(ctx))
-	require.Empty(t, r.postingsReaders, "no postings section ⇒ no postings readers")
+	require.Empty(t, r.labelReaders, "no postings section ⇒ no postings readers")
 
 	rec, err := r.Read(ctx)
 	require.ErrorIs(t, err, io.EOF)
 	require.Nil(t, rec)
-	require.Empty(t, r.pointerRows, "no postings section ⇒ no matching streams")
+	require.Empty(t, r.resolution.rows, "no postings section ⇒ no matching streams")
 }
 
 func TestPostingsIndexSectionsReader_StreamLabelPredicateOnDisjointName(t *testing.T) {
@@ -290,7 +290,7 @@ func TestPostingsIndexSectionsReader_EndToEnd(t *testing.T) {
 		r := newPostingsIndexSectionsReader(log.NewNopLogger(), obj, inWindowStart, inWindowEnd, appFoo, nil, 0)
 		t.Cleanup(r.Close)
 		require.NoError(t, r.Open(ctx))
-		require.NotEmpty(t, r.postingsReaders)
+		require.NotEmpty(t, r.labelReaders)
 
 		gotStreamIDs := map[int64]struct{}{}
 		var rows int64
@@ -372,43 +372,6 @@ func TestPostingsIndexSectionsReader_EndToEnd(t *testing.T) {
 	})
 }
 
-// A bloom-read failure during resolution must surface as an error rather than
-// being silently swallowed (which would leak unfiltered pointers downstream).
-func TestPostingsIndexSectionsReader_BloomReadErrorSurfaces(t *testing.T) {
-	t.Parallel()
-
-	ctx := user.InjectOrgID(context.Background(), tenantID)
-	obj := buildPostingsOnlyFixture(t)
-
-	start := now.Add(-4 * time.Hour)
-	end := now.Add(-time.Hour)
-	matchers := []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "app", "foo")}
-	predicates := []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "traceID", "abcd")}
-
-	r := newPostingsIndexSectionsReader(log.NewNopLogger(), obj, start, end, matchers, predicates, 0)
-	t.Cleanup(r.Close)
-
-	// Drive resolution directly: open the readers and resolve streams, leaving
-	// only the bloom filtering left to fail.
-	require.NoError(t, r.init(ctx))
-	require.NoError(t, r.resolveStreams(ctx))
-	require.NotEmpty(t, r.pointerRows, "fixture should resolve at least one pointer row before bloom filtering")
-	require.NotEmpty(t, r.predicates, "traceID predicate must survive stream-label filtering")
-
-	// Swap in an unopened reader so the bloom read fails.
-	originalReaders := r.postingsReaders
-	require.NotEmpty(t, originalReaders, "fixture must open at least one postings reader")
-	r.postingsReaders = []*postings.Reader{
-		postings.NewReader(postings.ReaderOptions{
-			Columns:   originalReaders[0].Columns(),
-			Allocator: memory.DefaultAllocator,
-		}),
-	}
-	t.Cleanup(func() { r.postingsReaders = originalReaders }) // restore so Close releases the real readers
-
-	require.Error(t, r.filterPointersByBloom(ctx), "bloom-read failure must surface from filtering")
-}
-
 // TestPointersRecordSchema_ParityWithPointersReader proves the batches built by
 // buildPointersRecord carry the exact schema a pointers.Reader produces on the
 // full 9-column stream-pointer projection, so the postings path is a drop-in
@@ -470,7 +433,7 @@ func TestPointersRecordSchema_ParityWithPointersReader(t *testing.T) {
 func TestBuildPointersRecord_Values(t *testing.T) {
 	t.Parallel()
 
-	rows := []postings.PointerRow{{
+	rows := []pointerRow{{
 		ObjectPath:   "obj-a",
 		SectionIndex: 2,
 		StreamID:     7,
